@@ -1,0 +1,15 @@
+[package]
+name = "openvst3-sys"
+version = "1.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "FFI to OpenVST3 shim plus loader for GetPluginFactory"
+
+[dependencies]
+libloading = "0.8"
+
+[build-dependencies]
+cc = "1.1"
+
+[dependencies.openvst3-shim]
+path = "../openvst3-shim"

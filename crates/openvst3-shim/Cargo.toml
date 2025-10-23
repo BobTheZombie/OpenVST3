@@ -1,0 +1,12 @@
+[package]
+name = "openvst3-shim"
+version = "1.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "C++ shim compiled against the VST3 SDK; exposes a C ABI used by Rust crates"
+
+[lib]
+crate-type = ["staticlib"]
+
+[build-dependencies]
+cc = "1.1"

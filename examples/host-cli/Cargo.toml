@@ -1,0 +1,10 @@
+[package]
+name = "host-cli"
+version = "1.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+openvst3-host = { path = "../../crates/openvst3-host" }

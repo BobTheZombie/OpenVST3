@@ -1,0 +1,10 @@
+[package]
+name = "openvst3-host"
+version = "1.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Functional VST3 host utilities on top of openvst3-sys"
+
+[dependencies]
+openvst3-sys = { path = "../openvst3-sys" }
+anyhow = "1.0"

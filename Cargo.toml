@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "crates/openvst3-shim",
+    "crates/openvst3-sys",
+    "crates/openvst3-host",
+    "examples/host-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
