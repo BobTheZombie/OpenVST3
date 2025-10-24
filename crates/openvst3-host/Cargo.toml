@@ -8,3 +8,4 @@ description = "Functional VST3 host utilities on top of openvst3-sys"
 [dependencies]
 openvst3-sys = { path = "../openvst3-sys" }
 anyhow = "1.0"
+bitflags = "2.4"

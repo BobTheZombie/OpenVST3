@@ -29,13 +29,19 @@ fn main() -> Result<()> {
     unsafe {
         let f = openvst3_host::LoadedFactory::load_plugin(&a.plugin)?;
         let classes = f.classes()?;
-        let cid = classes.first()
+        let cid = classes
+            .first()
             .ok_or_else(|| anyhow::anyhow!("no classes in factory"))?
             .cid;
         println!("Using class: {} [{}]", classes[0].name, classes[0].category);
         let mut proc = f.create_audio_processor(cid)?;
         proc.initialize()?;
-        proc.setup(a.sr as f64, a.block_size as i32, a.r#in as i32, a.out as i32)?;
+        proc.setup(
+            a.sr as f64,
+            a.block_size as i32,
+            a.r#in as i32,
+            a.out as i32,
+        )?;
         proc.set_active(true)?;
 
         // Prepare buffers

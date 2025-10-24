@@ -28,6 +28,15 @@ typedef void* v3_component;
 typedef void* v3_audio_processor;
 typedef void* v3_funknown;
 
+typedef struct {
+    int32_t media_type;
+    int32_t direction;
+    int32_t channel_count;
+    int32_t bus_type;
+    uint32_t flags;
+    char name[128];
+} v3_bus_info;
+
 // Factory utilities
 int  v3_factory_class_count(v3_factory f);
 int  v3_factory_class_info(v3_factory f, int idx, v3_class_info* out_info);
@@ -40,10 +49,16 @@ int  v3_release(v3_funknown obj);
 int  v3_component_initialize(v3_component c);
 int  v3_component_set_active(v3_component c, int state);
 int  v3_component_terminate(v3_component c);
+int  v3_component_get_bus_count(v3_component c, int32_t media_type, int32_t direction);
+int  v3_component_get_bus_info(v3_component c, int32_t media_type, int32_t direction, int32_t index, v3_bus_info* out_info);
+int  v3_component_activate_bus(v3_component c, int32_t media_type, int32_t direction, int32_t index, int state);
 
 // Processor
 int  v3_audio_processor_setup(v3_audio_processor p, double sample_rate, int32_t max_block, int32_t in_channels, int32_t out_channels);
 int  v3_audio_processor_set_active(v3_audio_processor p, int state);
+int  v3_audio_processor_set_processing(v3_audio_processor p, int state);
+int  v3_audio_processor_get_bus_arrangements(v3_audio_processor p, int32_t in_count, uint64_t* inputs, int32_t out_count, uint64_t* outputs);
+int  v3_audio_processor_set_bus_arrangements(v3_audio_processor p, int32_t in_count, const uint64_t* inputs, int32_t out_count, const uint64_t* outputs);
 
 // Process (float32, deinterleaved channel pointers)
 int  v3_audio_processor_process_f32(v3_audio_processor p,
@@ -57,7 +72,8 @@ int  v3_audio_processor_process_f32(v3_audio_processor p,
 "#;
     std::fs::write(&wrapper_h, header).unwrap();
 
-    let impl_cpp = format!(r#"
+    let impl_cpp = format!(
+        r#"
 #include <cstring>
 #include <vector>
 #include <string>
@@ -66,6 +82,7 @@ int  v3_audio_processor_process_f32(v3_audio_processor p,
 #include <pluginterfaces/base/ipluginbase.h>
 #include <pluginterfaces/base/funknown.h>
 #include <pluginterfaces/base/futils.h>
+#include <pluginterfaces/base/ustring.h>
 #include <pluginterfaces/vst/ivstcomponent.h>
 #include <pluginterfaces/vst/ivstaudioprocessor.h>
 #include <pluginterfaces/vst/ivstprocesscontext.h>
@@ -144,6 +161,35 @@ extern "C" int v3_component_terminate(void* c) {{
     return comp->terminate() == kResultOk ? 0 : -2;
 }}
 
+extern "C" int v3_component_get_bus_count(void* c, int32 media_type, int32 direction) {{
+    if (!c) return -1;
+    auto* comp = reinterpret_cast<IComponent*>(c);
+    return (int)comp->getBusCount((MediaTypes)media_type, (BusDirections)direction);
+}}
+
+extern "C" int v3_component_get_bus_info(void* c, int32 media_type, int32 direction, int32 index, v3_bus_info* out_info) {{
+    if (!c || !out_info) return -1;
+    auto* comp = reinterpret_cast<IComponent*>(c);
+    BusInfo info{{}};
+    tresult r = comp->getBusInfo((MediaTypes)media_type, (BusDirections)direction, index, info);
+    if (r != kResultOk) return -2;
+    std::memset(out_info, 0, sizeof(*out_info));
+    out_info->media_type = media_type;
+    out_info->direction = direction;
+    out_info->channel_count = info.channelCount;
+    out_info->bus_type = info.busType;
+    out_info->flags = info.flags;
+    Steinberg::String name(info.name);
+    name.toMultiByte(kCP_UTF8, out_info->name, sizeof(out_info->name));
+    return 0;
+}}
+
+extern "C" int v3_component_activate_bus(void* c, int32 media_type, int32 direction, int32 index, int state) {{
+    if (!c) return -1;
+    auto* comp = reinterpret_cast<IComponent*>(c);
+    return comp->activateBus((MediaTypes)media_type, (BusDirections)direction, index, state ? true : false) == kResultOk ? 0 : -2;
+}}
+
 extern "C" int v3_audio_processor_setup(void* p, double sample_rate, int32 max_block, int32 in_channels, int32 out_channels) {{
     if (!p) return -1;
     auto* proc = reinterpret_cast<IAudioProcessor*>(p);
@@ -166,6 +212,38 @@ extern "C" int v3_audio_processor_set_active(void* p, int state) {{
     if (!p) return -1;
     auto* proc = reinterpret_cast<IAudioProcessor*>(p);
     return proc->setActive(state?true:false) == kResultOk ? 0 : -2;
+}}
+
+extern "C" int v3_audio_processor_set_processing(void* p, int state) {{
+    if (!p) return -1;
+    auto* proc = reinterpret_cast<IAudioProcessor*>(p);
+    return proc->setProcessing(state ? true : false) == kResultOk ? 0 : -2;
+}}
+
+extern "C" int v3_audio_processor_get_bus_arrangements(void* p, int32 in_count, uint64_t* inputs, int32 out_count, uint64_t* outputs) {{
+    if (!p) return -1;
+    if ((in_count > 0 && !inputs) || (out_count > 0 && !outputs)) return -2;
+    auto* proc = reinterpret_cast<IAudioProcessor*>(p);
+    auto* ins = reinterpret_cast<SpeakerArrangement*>(inputs);
+    auto* outs = reinterpret_cast<SpeakerArrangement*>(outputs);
+    return proc->getBusArrangements(ins, in_count, outs, out_count) == kResultOk ? 0 : -3;
+}}
+
+extern "C" int v3_audio_processor_set_bus_arrangements(void* p, int32 in_count, const uint64_t* inputs, int32 out_count, const uint64_t* outputs) {{
+    if (!p) return -1;
+    if ((in_count > 0 && !inputs) || (out_count > 0 && !outputs)) return -2;
+    auto* proc = reinterpret_cast<IAudioProcessor*>(p);
+    std::vector<SpeakerArrangement> ins;
+    std::vector<SpeakerArrangement> outs;
+    ins.reserve(in_count);
+    outs.reserve(out_count);
+    for (int32 i = 0; i < in_count; ++i) {{
+        ins.push_back(static_cast<SpeakerArrangement>(inputs[i]));
+    }}
+    for (int32 i = 0; i < out_count; ++i) {{
+        outs.push_back(static_cast<SpeakerArrangement>(outputs[i]));
+    }}
+    return proc->setBusArrangements(ins.data(), in_count, outs.data(), out_count) == kResultOk ? 0 : -3;
 }}
 
 extern "C" int v3_audio_processor_process_f32(void* p,
@@ -198,11 +276,14 @@ extern "C" int v3_audio_processor_process_f32(void* p,
     return proc->process(data) == kResultOk ? 0 : -2;
 }}
 
-"#, h=wrapper_h.file_name().unwrap().to_string_lossy());
+"#,
+        h = wrapper_h.file_name().unwrap().to_string_lossy()
+    );
     std::fs::write(&wrapper_cpp, impl_cpp).unwrap();
 
     let mut build = cc::Build::new();
-    build.cpp(true)
+    build
+        .cpp(true)
         .files([wrapper_cpp])
         .flag_if_supported("-std=c++17")
         .include(&sdk)
