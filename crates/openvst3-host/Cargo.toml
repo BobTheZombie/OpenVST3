@@ -1,11 +1,15 @@
 [package]
 name = "openvst3-host"
-version = "1.0.0"
+version = "0.0.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Functional VST3 host utilities on top of openvst3-sys"
+description = "Header-free Rust host utilities for VST3: load module, get factory, enumerate classes"
+
+[lib]
+name = "openvst3_host"
+path = "src/lib.rs"
 
 [dependencies]
-openvst3-sys = { path = "../openvst3-sys" }
-anyhow = "1.0"
-bitflags = "2.4"
+libloading = { workspace = true }
+thiserror = { workspace = true }
+openvst3-abi = { path = "../openvst3-abi" }

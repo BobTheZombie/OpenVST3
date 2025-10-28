@@ -1,0 +1,17 @@
+[package]
+name = "openvst3-abi"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Header-free, clean-room Rust ABI for VST3 (FUnknown, IPluginFactory, TUID/FUID, entry points)"
+
+[lib]
+name = "openvst3_abi"
+path = "src/lib.rs"
+
+[features]
+default = []
+std = []
+
+[dependencies]
+bitflags = { workspace = true }
