@@ -1,13 +1,11 @@
 use libloading::{Library, Symbol};
-use std::ffi::c_void;
 use std::path::{Path, PathBuf};
-use std::ptr::{self, NonNull};
 use thiserror::Error;
 
 use openvst3_abi::{
-    classinfo_consts, process_consts, AudioBusBuffers32, FUnknown, FactoryHandle,
-    GetPluginFactoryProc, IAudioProcessor, IPluginFactory, PClassInfo, ProcessData32, ProcessSetup,
-    Tuid, K_RESULT_OK,
+    classinfo_consts, process_consts, AudioBusBuffers32, AudioBusBuffers64, BusInfo, FUnknown,
+    FactoryHandle, GetPluginFactoryProc, IAudioProcessor, IComponent, IPluginFactory, PClassInfo,
+    ProcessData32, ProcessData64, ProcessSetup, Tuid, BUS_DIR_OUTPUT, K_RESULT_OK,
 };
 
 #[derive(Debug, Error)]
@@ -24,28 +22,21 @@ pub enum HostError {
     BinaryNotFound,
     #[error("utf8 error in class info")]
     Utf8,
-    #[error(
-        "IID hex string must contain 32 hex characters (after removing separators), found {0}"
-    )]
-    HexLength(usize),
-    #[error("invalid IID hex pair `{0}`")]
-    HexParse(String),
-    #[error("operation `{0}` failed with tresult {1}")]
-    TResult(&'static str, i32),
-    #[error("createInstance returned null object")]
-    NullObject,
-    #[error("audio processor pointer was null")]
-    NullProcessor,
+    #[error("tresult failure: {0}")]
+    TErr(i32),
+    #[error("allocation")]
+    Alloc,
+    #[error("query interface failed")]
+    NoInterface,
 }
 
-/// Handle for a loaded VST3 module binary (inner .dll/.dylib/.so)
+/// Handle for a loaded VST3 module binary
 pub struct Module {
-    _lib: Library,
+    lib: Library,
     factory: FactoryHandle,
 }
 
 impl Module {
-    /// Load a platform binary (NOT the outer `.vst3` directory).
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, HostError> {
         let lib =
             unsafe { Library::new(path.as_ref()) }.map_err(|e| HostError::Dlopen(e.to_string()))?;
@@ -55,19 +46,16 @@ impl Module {
         };
         let raw = unsafe { get_factory() };
         let factory = unsafe { FactoryHandle::new(raw) }.ok_or(HostError::NullFactory)?;
-        Ok(Self { _lib: lib, factory })
+        Ok(Self { lib, factory })
     }
-
     #[inline]
     pub fn factory_mut(&mut self) -> &mut IPluginFactory {
         self.factory.as_mut()
     }
 }
-
 unsafe impl Send for Module {}
 unsafe impl Sync for Module {}
 
-/// Utility: count classes via IPluginFactory
 pub fn count_classes(module: &mut Module) -> i32 {
     unsafe { module.factory_mut().count_classes() }
 }
@@ -75,24 +63,33 @@ pub fn count_classes(module: &mut Module) -> i32 {
 /// BundlePath: resolve `.vst3` directory to inner binary per platform
 pub struct BundlePath;
 
+fn first_file(dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(dir).ok()?.find_map(|e| {
+        e.ok().and_then(|entry| {
+            let path = entry.path();
+            if path.is_file() {
+                Some(path)
+            } else {
+                None
+            }
+        })
+    })
+}
+
 impl BundlePath {
     pub fn resolve<P: AsRef<Path>>(bundle: P) -> Result<PathBuf, HostError> {
         let b = bundle.as_ref();
         if !b.is_dir() || b.extension().and_then(|s| s.to_str()) != Some("vst3") {
             return Err(HostError::InvalidBundle(format!("{}", b.display())));
         }
-
         #[cfg(target_os = "macos")]
         {
-            // My.vst3/Contents/MacOS/<binary>
             let p = b.join("Contents").join("MacOS");
             let bin = first_file(&p).ok_or(HostError::BinaryNotFound)?;
             return Ok(bin);
         }
-
         #[cfg(target_os = "linux")]
         {
-            // My.vst3/Contents/x86_64-linux/<binary>.so (or aarch64-linux)
             let arch = if cfg!(target_arch = "x86_64") {
                 "x86_64-linux"
             } else if cfg!(target_arch = "aarch64") {
@@ -104,10 +101,8 @@ impl BundlePath {
             let bin = first_file(&p).ok_or(HostError::BinaryNotFound)?;
             return Ok(bin);
         }
-
         #[cfg(target_os = "windows")]
         {
-            // My.vst3/Contents/x86_64-win/My.vst3  (binary is named .vst3)
             let arch = if cfg!(target_arch = "x86_64") {
                 "x86_64-win"
             } else {
@@ -120,18 +115,8 @@ impl BundlePath {
     }
 }
 
-fn first_file(dir: &Path) -> Option<PathBuf> {
-    std::fs::read_dir(dir).ok().and_then(|entries| {
-        entries
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .find(|path| path.is_file())
-    })
-}
-
-/// Convert a fixed-size i8 array (C string) to Rust String
+// ----- Class info helpers (v1) -----------------------------------------------
 fn cstr_from_i8_fixed(buf: &[i8]) -> Result<String, HostError> {
-    // Find first NUL or end
     let mut bytes: Vec<u8> = Vec::with_capacity(buf.len());
     for &ch in buf {
         if ch == 0 {
@@ -142,7 +127,6 @@ fn cstr_from_i8_fixed(buf: &[i8]) -> Result<String, HostError> {
     String::from_utf8(bytes).map_err(|_| HostError::Utf8)
 }
 
-/// Read class info at index using v1 API
 pub fn read_class_info_v1(
     module: &mut Module,
     index: i32,
@@ -158,14 +142,11 @@ pub fn read_class_info_v1(
             .factory_mut()
             .get_class_info(index, &mut info as *mut _)
     };
-    if tr != openvst3_abi::K_RESULT_OK {
-        return Err(HostError::InvalidBundle(format!(
-            "getClassInfo({index}) -> {tr}"
-        )));
+    if tr != K_RESULT_OK {
+        return Err(HostError::TErr(tr));
     }
     let name = cstr_from_i8_fixed(&info.name)?;
     let category = cstr_from_i8_fixed(&info.category)?;
-    // copy CID bytes as u8
     let mut cid = [0u8; 16];
     for (i, b) in info.cid.iter().enumerate() {
         cid[i] = *b as u8;
@@ -173,7 +154,6 @@ pub fn read_class_info_v1(
     Ok((name, category, cid))
 }
 
-/// Pretty-hex for CID
 pub fn fmt_cid_hex(cid: &[u8; 16]) -> String {
     let mut s = String::with_capacity(32);
     for b in cid {
@@ -182,7 +162,6 @@ pub fn fmt_cid_hex(cid: &[u8; 16]) -> String {
     s
 }
 
-/// Scan and print all classes
 pub fn list_classes(
     module: &mut Module,
 ) -> Result<Vec<(i32, String, String, [u8; 16])>, HostError> {
@@ -196,132 +175,188 @@ pub fn list_classes(
     Ok(out)
 }
 
-/// Parse a 16-byte IID/CID from a hex string (accepts optional whitespace/hyphens)
-pub fn parse_hex_16(input: &str) -> Result<Tuid, HostError> {
-    let filtered: String = input
-        .chars()
-        .filter(|c| !c.is_ascii_whitespace() && *c != '-')
-        .collect();
-    if filtered.len() != 32 {
-        return Err(HostError::HexLength(filtered.len()));
+// ===== Phase 4 helpers: IID parsing, QI, process 32f/64f =====================
+pub fn parse_hex_16(s: &str) -> Result<[u8; 16], HostError> {
+    let t = s
+        .trim()
+        .replace(|c: char| c == '-' || c == '{' || c == '}' || c == ' ', "");
+    if t.len() != 32 {
+        return Err(HostError::InvalidBundle(
+            "IID hex must be 16 bytes (32 hex chars)".into(),
+        ));
     }
-    let mut bytes = [0u8; 16];
-    for (i, chunk) in filtered.as_bytes().chunks(2).enumerate() {
-        let pair = match std::str::from_utf8(chunk) {
-            Ok(p) => p,
-            Err(_) => return Err(HostError::HexParse(format!("{:?}", chunk))),
-        };
-        let byte =
-            u8::from_str_radix(pair, 16).map_err(|_| HostError::HexParse(pair.to_string()))?;
-        bytes[i] = byte;
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = u8::from_str_radix(&t[2 * i..2 * i + 2], 16)
+            .map_err(|_| HostError::InvalidBundle("bad hex".into()))?;
     }
-    Ok(Tuid::new(bytes))
+    Ok(out)
 }
 
-/// Unsafe helper: create raw instance pointer via IPluginFactory
+/// Create an instance using cid & iid (both raw 16-byte); returns raw void*.
 pub unsafe fn create_instance_raw(
     factory: &mut IPluginFactory,
-    cid_bytes: [u8; 16],
-    iid: Tuid,
-) -> Result<*mut c_void, HostError> {
-    let mut obj: *mut c_void = ptr::null_mut();
-    let cid = Tuid::new(cid_bytes);
-    let tr = factory.create_instance_raw(&cid, &iid, &mut obj as *mut _);
-    if tr != K_RESULT_OK {
-        return Err(HostError::TResult("createInstance", tr));
-    }
-    if obj.is_null() {
-        return Err(HostError::NullObject);
+    cid: [u8; 16],
+    iid: [u8; 16],
+) -> Result<*mut core::ffi::c_void, HostError> {
+    let mut obj: *mut core::ffi::c_void = core::ptr::null_mut();
+    let tr = factory.create_instance_raw(&Tuid(cid), &Tuid(iid), &mut obj);
+    if tr != K_RESULT_OK || obj.is_null() {
+        return Err(HostError::TErr(tr));
     }
     Ok(obj)
 }
 
-/// Drive a single 32-bit floating-point process block with silent buffers
+/// Try QueryInterface on an object (FUnknown*) for a new IID; returns raw void*.
+pub unsafe fn query_interface(
+    obj: *mut core::ffi::c_void,
+    iid: [u8; 16],
+) -> Result<*mut core::ffi::c_void, HostError> {
+    let fu: &mut FUnknown = &mut *(obj as *mut FUnknown);
+    let mut out: *mut core::ffi::c_void = core::ptr::null_mut();
+    let tr = fu.query_interface(&Tuid(iid), &mut out);
+    if tr != K_RESULT_OK || out.is_null() {
+        return Err(HostError::NoInterface);
+    }
+    Ok(out)
+}
+
+/// Read the first output bus channel count if available (graceful on failure)
+pub unsafe fn detect_output_channels(comp_ptr: *mut IComponent) -> i32 {
+    let comp = &mut *comp_ptr;
+    let count = comp.get_bus_count(0, BUS_DIR_OUTPUT);
+    if count <= 0 {
+        return 2;
+    }
+    let mut info = BusInfo {
+        media_type: 0,
+        direction: BUS_DIR_OUTPUT,
+        channel_count: 0,
+        name: [0; 64],
+        bus_type: 0,
+        flags: 0,
+    };
+    let _ = comp.get_bus_info(0, BUS_DIR_OUTPUT, 0, &mut info as *mut _);
+    if info.channel_count > 0 {
+        info.channel_count
+    } else {
+        2
+    }
+}
+
+/// Drive one 32f process block on an IAudioProcessor*
 pub unsafe fn drive_null_process_32f(
-    instance: *mut c_void,
-    sample_rate: f64,
-    frames: i32,
+    proc_ptr: *mut IAudioProcessor,
+    sr: f64,
+    nframes: i32,
     outs: i32,
 ) -> Result<(), HostError> {
-    let mut proc =
-        NonNull::new(instance as *mut IAudioProcessor).ok_or(HostError::NullProcessor)?;
-    let proc = proc.as_mut();
+    let proc = &mut *proc_ptr;
 
-    let mut need_terminate = false;
-    let mut processing_on = false;
-
-    let result = || -> Result<(), HostError> {
-        let tr = proc.initialize(ptr::null_mut());
-        if tr != K_RESULT_OK {
-            return Err(HostError::TResult("IAudioProcessor::initialize", tr));
-        }
-        need_terminate = true;
-
-        let frames_nonneg = frames.max(0);
-        let outs_nonneg = outs.max(0);
-
-        let setup = ProcessSetup {
-            process_mode: process_consts::PROCESS_MODE_REALTIME,
-            sample_rate,
-            max_samples_per_block: frames_nonneg,
-            symbolic_sample_size: process_consts::SYMBOLIC_SAMPLE_32,
-            flags: 0,
-        };
-        let tr = proc.setup_processing(&setup);
-        if tr != K_RESULT_OK {
-            return Err(HostError::TResult("IAudioProcessor::setupProcessing", tr));
-        }
-
-        let frame_count = frames_nonneg as usize;
-        let out_channels = outs_nonneg as usize;
-        let mut channel_storage: Vec<Vec<openvst3_abi::Sample32>> =
-            (0..out_channels).map(|_| vec![0.0; frame_count]).collect();
-        let mut channel_ptrs: Vec<*mut openvst3_abi::Sample32> = channel_storage
-            .iter_mut()
-            .map(|buf| buf.as_mut_ptr())
-            .collect();
-        let mut out_bus = AudioBusBuffers32 {
-            num_channels: outs_nonneg,
-            silence_flags: if outs_nonneg <= 0 {
-                0
-            } else if outs_nonneg as u32 >= 64 {
-                u64::MAX
-            } else {
-                (1u64 << outs_nonneg) - 1
-            },
-            channel_buffers: channel_ptrs.as_mut_ptr(),
-        };
-        let mut process_data = ProcessData32 {
-            num_inputs: 0,
-            num_outputs: 1,
-            inputs: ptr::null_mut(),
-            outputs: &mut out_bus as *mut _,
-            num_samples: frames_nonneg,
-        };
-
-        let tr = proc.set_processing(1);
-        if tr != K_RESULT_OK {
-            return Err(HostError::TResult("IAudioProcessor::setProcessing(1)", tr));
-        }
-        processing_on = true;
-
-        let tr = proc.process_32f(&mut process_data);
-        if tr != K_RESULT_OK {
-            return Err(HostError::TResult("IAudioProcessor::process", tr));
-        }
-
-        Ok(())
-    }();
-
-    if processing_on {
-        let _ = proc.set_processing(0);
-    }
-    if need_terminate {
-        let _ = proc.terminate();
+    // initialize(null)
+    let tr = proc.initialize(core::ptr::null_mut::<FUnknown>());
+    if tr != K_RESULT_OK {
+        return Err(HostError::TErr(tr));
     }
 
-    let unknown = instance as *mut FUnknown;
-    let _ = (*unknown).release();
+    // setupProcessing
+    let setup = ProcessSetup {
+        process_mode: process_consts::PROCESS_MODE_REALTIME,
+        sample_rate: sr,
+        max_samples_per_block: nframes,
+        symbolic_sample_size: process_consts::SYMBOLIC_SAMPLE_32,
+        flags: 0,
+    };
+    let tr = proc.setup_processing(&setup);
+    if tr != K_RESULT_OK {
+        return Err(HostError::TErr(tr));
+    }
 
-    result
+    // allocate output buffers (silence)
+    let mut chans: Vec<Vec<f32>> = (0..outs).map(|_| vec![0.0f32; nframes as usize]).collect();
+    let mut chan_ptrs: Vec<*mut f32> = chans.iter_mut().map(|c| c.as_mut_ptr()).collect();
+    let mut outs_bus = AudioBusBuffers32 {
+        num_channels: outs,
+        silence_flags: 0,
+        channel_buffers: chan_ptrs.as_mut_ptr(),
+    };
+
+    let mut data = ProcessData32 {
+        num_inputs: 0,
+        num_outputs: 1,
+        inputs: core::ptr::null_mut(),
+        outputs: &mut outs_bus,
+        num_samples: nframes,
+    };
+
+    let tr = proc.set_processing(1);
+    if tr != K_RESULT_OK {
+        return Err(HostError::TErr(tr));
+    }
+
+    let tr = proc.process_32f(&mut data);
+    let _ = proc.set_processing(0);
+    let _ = proc.terminate();
+
+    if tr != K_RESULT_OK {
+        return Err(HostError::TErr(tr));
+    }
+    Ok(())
+}
+
+/// Drive one 64f process block on an IAudioProcessor*
+pub unsafe fn drive_null_process_64f(
+    proc_ptr: *mut IAudioProcessor,
+    sr: f64,
+    nframes: i32,
+    outs: i32,
+) -> Result<(), HostError> {
+    let proc = &mut *proc_ptr;
+
+    let tr = proc.initialize(core::ptr::null_mut::<FUnknown>());
+    if tr != K_RESULT_OK {
+        return Err(HostError::TErr(tr));
+    }
+
+    let setup = ProcessSetup {
+        process_mode: process_consts::PROCESS_MODE_REALTIME,
+        sample_rate: sr,
+        max_samples_per_block: nframes,
+        symbolic_sample_size: process_consts::SYMBOLIC_SAMPLE_64,
+        flags: 0,
+    };
+    let tr = proc.setup_processing(&setup);
+    if tr != K_RESULT_OK {
+        return Err(HostError::TErr(tr));
+    }
+
+    let mut chans: Vec<Vec<f64>> = (0..outs).map(|_| vec![0.0f64; nframes as usize]).collect();
+    let mut chan_ptrs: Vec<*mut f64> = chans.iter_mut().map(|c| c.as_mut_ptr()).collect();
+    let mut outs_bus = AudioBusBuffers64 {
+        num_channels: outs,
+        silence_flags: 0,
+        channel_buffers: chan_ptrs.as_mut_ptr(),
+    };
+
+    let mut data = ProcessData64 {
+        num_inputs: 0,
+        num_outputs: 1,
+        inputs: core::ptr::null_mut(),
+        outputs: &mut outs_bus,
+        num_samples: nframes,
+    };
+
+    let tr = proc.set_processing(1);
+    if tr != K_RESULT_OK {
+        return Err(HostError::TErr(tr));
+    }
+
+    let tr = proc.process_64f(&mut data);
+    let _ = proc.set_processing(0);
+    let _ = proc.terminate();
+
+    if tr != K_RESULT_OK {
+        return Err(HostError::TErr(tr));
+    }
+    Ok(())
 }

@@ -1,9 +1,9 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-#![allow(non_camel_case_types)]
 //! Clean-room, header-free ABI surfaces for VST3 hosting.
-//! Phase 1: FUnknown, IPluginFactory
-//! Phase 2: PClassInfo
-//! Phase 3: IPluginBase, IComponent, IAudioProcessor + processing structs (minimal)
+//! Ph1: FUnknown/IPluginFactory
+//! Ph2: Class info
+//! Ph3: IPluginBase/IComponent/IAudioProcessor + 32f processing
+//! Ph4: QueryInterface helpers, 64f processing, BusInfo (read-only)
 
 use core::ffi::c_void;
 use core::ptr::NonNull;
@@ -171,36 +171,28 @@ impl FactoryHandle {
 unsafe impl Send for FactoryHandle {}
 unsafe impl Sync for FactoryHandle {}
 
-// ===== Phase 3: Processing surfaces ==========================================
-//
-// NOTE: These are *minimal* signatures/types to enable a null-host test.
-// We avoid copying header text; names and roles follow public docs.
-//
-// --- enums/consts (symbolic sample type, process mode, flags) ---
+// ===== Phase 3/4: Processing & Bus Info ======================================
 pub mod process_consts {
     pub const SYMBOLIC_SAMPLE_32: i32 = 0;
     pub const SYMBOLIC_SAMPLE_64: i32 = 1;
 
     pub const PROCESS_MODE_REALTIME: i32 = 0;
     pub const PROCESS_MODE_PREFETCH: i32 = 1;
-
-    pub const PROCESS_SETUP_HAS_TAIL: i32 = 1 << 0;
 }
 
 pub type Sample32 = f32;
 pub type Sample64 = f64;
 
-// --- ProcessSetup ---
 #[repr(C)]
 pub struct ProcessSetup {
-    pub process_mode: int32, // symbolic
+    pub process_mode: int32,
     pub sample_rate: f64,
     pub max_samples_per_block: int32,
     pub symbolic_sample_size: int32, // 0=32f, 1=64f
-    pub flags: int32,                // optional features
+    pub flags: int32,
 }
 
-// --- AudioBusBuffers (32-bit path only for now) ---
+// 32-bit audio buffers
 #[repr(C)]
 pub struct AudioBusBuffers32 {
     pub num_channels: int32,
@@ -208,7 +200,6 @@ pub struct AudioBusBuffers32 {
     pub channel_buffers: *mut *mut Sample32, // [num_channels][num_samples]
 }
 
-// --- ProcessData (trimmed: audio only, 32-bit) ---
 #[repr(C)]
 pub struct ProcessData32 {
     pub num_inputs: int32,
@@ -216,10 +207,41 @@ pub struct ProcessData32 {
     pub inputs: *mut AudioBusBuffers32,
     pub outputs: *mut AudioBusBuffers32,
     pub num_samples: int32,
-    // Skipping events/parameters for Phase 3 boot
 }
 
-// --- IPluginBase ---
+// 64-bit audio buffers
+#[repr(C)]
+pub struct AudioBusBuffers64 {
+    pub num_channels: int32,
+    pub silence_flags: uint64,
+    pub channel_buffers: *mut *mut Sample64,
+}
+
+#[repr(C)]
+pub struct ProcessData64 {
+    pub num_inputs: int32,
+    pub num_outputs: int32,
+    pub inputs: *mut AudioBusBuffers64,
+    pub outputs: *mut AudioBusBuffers64,
+    pub num_samples: int32,
+}
+
+// --- Bus info (read-only subset) ---------------------------------------------
+// Bus direction: 0=input, 1=output (commonly used values)
+pub const BUS_DIR_INPUT: int32 = 0;
+pub const BUS_DIR_OUTPUT: int32 = 1;
+
+#[repr(C)]
+pub struct BusInfo {
+    pub media_type: int32, // 0=audio, others later
+    pub direction: int32,  // 0=in, 1=out
+    pub channel_count: int32,
+    pub name: [i8; 64],  // fixed-size cstr; size chosen generously
+    pub bus_type: int32, // 0=main, others later
+    pub flags: uint32,   // speaker arrangement availability etc. (not interpreted here)
+}
+
+// --- IPluginBase --------------------------------------------------------------
 #[repr(C)]
 pub struct IPluginBaseVTable {
     pub query_interface: unsafe extern "C" fn(
@@ -234,7 +256,6 @@ pub struct IPluginBaseVTable {
         unsafe extern "C" fn(this_: *mut IPluginBase, context: *mut FUnknown) -> tresult,
     pub terminate: unsafe extern "C" fn(this_: *mut IPluginBase) -> tresult,
 }
-
 #[repr(C)]
 pub struct IPluginBase {
     pub vtbl: *const IPluginBaseVTable,
@@ -250,7 +271,7 @@ impl IPluginBase {
     }
 }
 
-// --- IComponent (subset used by host boot) ---
+// --- IComponent (subset) ------------------------------------------------------
 #[repr(C)]
 pub struct IComponentVTable {
     pub query_interface: unsafe extern "C" fn(
@@ -265,10 +286,20 @@ pub struct IComponentVTable {
     pub initialize: unsafe extern "C" fn(this_: *mut IComponent, context: *mut FUnknown) -> tresult,
     pub terminate: unsafe extern "C" fn(this_: *mut IComponent) -> tresult,
 
-    // Minimal subset of IComponent methods we’ll likely use later:
+    // Subset we use:
     pub get_controller_class_id:
         unsafe extern "C" fn(this_: *mut IComponent, cid: *mut Tuid) -> tresult,
-    // (more methods come later)
+
+    // Bus enumeration (read-only for now)
+    pub get_bus_count:
+        unsafe extern "C" fn(this_: *mut IComponent, media_type: int32, direction: int32) -> int32,
+    pub get_bus_info: unsafe extern "C" fn(
+        this_: *mut IComponent,
+        media_type: int32,
+        direction: int32,
+        index: int32,
+        info: *mut BusInfo,
+    ) -> tresult,
 }
 
 #[repr(C)]
@@ -288,9 +319,23 @@ impl IComponent {
     pub unsafe fn get_controller_class_id(&mut self, cid: *mut Tuid) -> tresult {
         ((*self.vtbl).get_controller_class_id)(self, cid)
     }
+    #[inline]
+    pub unsafe fn get_bus_count(&mut self, media_type: int32, direction: int32) -> int32 {
+        ((*self.vtbl).get_bus_count)(self, media_type, direction)
+    }
+    #[inline]
+    pub unsafe fn get_bus_info(
+        &mut self,
+        media_type: int32,
+        direction: int32,
+        index: int32,
+        info: *mut BusInfo,
+    ) -> tresult {
+        ((*self.vtbl).get_bus_info)(self, media_type, direction, index, info)
+    }
 }
 
-// --- IAudioProcessor (subset to run a null block, 32-bit float only) ---
+// --- IAudioProcessor (subset + 64f) ------------------------------------------
 #[repr(C)]
 pub struct IAudioProcessorVTable {
     pub query_interface: unsafe extern "C" fn(
@@ -312,7 +357,8 @@ pub struct IAudioProcessorVTable {
         unsafe extern "C" fn(this_: *mut IAudioProcessor, setup: *const ProcessSetup) -> tresult,
     pub process_32f:
         unsafe extern "C" fn(this_: *mut IAudioProcessor, data: *mut ProcessData32) -> tresult,
-    // (bus arrangement etc. can come later)
+    pub process_64f:
+        unsafe extern "C" fn(this_: *mut IAudioProcessor, data: *mut ProcessData64) -> tresult,
 }
 
 #[repr(C)]
@@ -339,5 +385,49 @@ impl IAudioProcessor {
     #[inline]
     pub unsafe fn process_32f(&mut self, d: &mut ProcessData32) -> tresult {
         ((*self.vtbl).process_32f)(self, d as *mut _)
+    }
+    #[inline]
+    pub unsafe fn process_64f(&mut self, d: &mut ProcessData64) -> tresult {
+        ((*self.vtbl).process_64f)(self, d as *mut _)
+    }
+}
+
+// ===== Optional: runtime IID registry (names -> bytes) =======================
+// We keep this tiny helper here so callers can avoid hardcoding magic hex.
+#[cfg(feature = "std")]
+pub mod iid_registry {
+    use super::Tuid;
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    pub struct Registry {
+        map: BTreeMap<String, Tuid>,
+    }
+    impl Registry {
+        pub fn new() -> Self {
+            Self {
+                map: BTreeMap::new(),
+            }
+        }
+        pub fn insert_hex(&mut self, name: &str, hex32: &str) -> Result<(), ()> {
+            let t = hex32
+                .trim()
+                .replace(|c: char| c == '-' || c == '{' || c == '}' || c == ' ', "");
+            if t.len() != 32 {
+                return Err(());
+            }
+            let mut out = [0u8; 16];
+            for i in 0..16 {
+                out[i] = u8::from_str_radix(&t[2 * i..2 * i + 2], 16).map_err(|_| ())?;
+            }
+            self.map.insert(name.to_string(), Tuid(out));
+            Ok(())
+        }
+        pub fn get(&self, name: &str) -> Option<Tuid> {
+            self.map.get(name).copied()
+        }
+        pub fn insert_raw(&mut self, name: &str, iid: Tuid) {
+            self.map.insert(name.to_string(), iid);
+        }
     }
 }

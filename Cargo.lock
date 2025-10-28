@@ -121,6 +121,7 @@ name = "host-cli"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "openvst3-abi",
  "openvst3-host",
 ]
 

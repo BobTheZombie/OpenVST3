@@ -1,0 +1,4 @@
+# Example names -> 16-byte hex (no braces/dashes necessary)
+# IAudioProcessor = "00000000000000000000000000000000"
+# IComponent      = "00000000000000000000000000000000"
+# IPluginBase     = "00000000000000000000000000000000"
