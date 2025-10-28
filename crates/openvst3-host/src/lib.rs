@@ -1,9 +1,13 @@
 use libloading::{Library, Symbol};
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::ptr::{self, NonNull};
 use thiserror::Error;
 
 use openvst3_abi::{
-    classinfo_consts, FactoryHandle, GetPluginFactoryProc, IPluginFactory, PClassInfo,
+    classinfo_consts, process_consts, AudioBusBuffers32, FUnknown, FactoryHandle,
+    GetPluginFactoryProc, IAudioProcessor, IPluginFactory, PClassInfo, ProcessData32, ProcessSetup,
+    Tuid, K_RESULT_OK,
 };
 
 #[derive(Debug, Error)]
@@ -20,6 +24,18 @@ pub enum HostError {
     BinaryNotFound,
     #[error("utf8 error in class info")]
     Utf8,
+    #[error(
+        "IID hex string must contain 32 hex characters (after removing separators), found {0}"
+    )]
+    HexLength(usize),
+    #[error("invalid IID hex pair `{0}`")]
+    HexParse(String),
+    #[error("operation `{0}` failed with tresult {1}")]
+    TResult(&'static str, i32),
+    #[error("createInstance returned null object")]
+    NullObject,
+    #[error("audio processor pointer was null")]
+    NullProcessor,
 }
 
 /// Handle for a loaded VST3 module binary (inner .dll/.dylib/.so)
@@ -178,4 +194,134 @@ pub fn list_classes(
         }
     }
     Ok(out)
+}
+
+/// Parse a 16-byte IID/CID from a hex string (accepts optional whitespace/hyphens)
+pub fn parse_hex_16(input: &str) -> Result<Tuid, HostError> {
+    let filtered: String = input
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace() && *c != '-')
+        .collect();
+    if filtered.len() != 32 {
+        return Err(HostError::HexLength(filtered.len()));
+    }
+    let mut bytes = [0u8; 16];
+    for (i, chunk) in filtered.as_bytes().chunks(2).enumerate() {
+        let pair = match std::str::from_utf8(chunk) {
+            Ok(p) => p,
+            Err(_) => return Err(HostError::HexParse(format!("{:?}", chunk))),
+        };
+        let byte =
+            u8::from_str_radix(pair, 16).map_err(|_| HostError::HexParse(pair.to_string()))?;
+        bytes[i] = byte;
+    }
+    Ok(Tuid::new(bytes))
+}
+
+/// Unsafe helper: create raw instance pointer via IPluginFactory
+pub unsafe fn create_instance_raw(
+    factory: &mut IPluginFactory,
+    cid_bytes: [u8; 16],
+    iid: Tuid,
+) -> Result<*mut c_void, HostError> {
+    let mut obj: *mut c_void = ptr::null_mut();
+    let cid = Tuid::new(cid_bytes);
+    let tr = factory.create_instance_raw(&cid, &iid, &mut obj as *mut _);
+    if tr != K_RESULT_OK {
+        return Err(HostError::TResult("createInstance", tr));
+    }
+    if obj.is_null() {
+        return Err(HostError::NullObject);
+    }
+    Ok(obj)
+}
+
+/// Drive a single 32-bit floating-point process block with silent buffers
+pub unsafe fn drive_null_process_32f(
+    instance: *mut c_void,
+    sample_rate: f64,
+    frames: i32,
+    outs: i32,
+) -> Result<(), HostError> {
+    let mut proc =
+        NonNull::new(instance as *mut IAudioProcessor).ok_or(HostError::NullProcessor)?;
+    let proc = proc.as_mut();
+
+    let mut need_terminate = false;
+    let mut processing_on = false;
+
+    let result = || -> Result<(), HostError> {
+        let tr = proc.initialize(ptr::null_mut());
+        if tr != K_RESULT_OK {
+            return Err(HostError::TResult("IAudioProcessor::initialize", tr));
+        }
+        need_terminate = true;
+
+        let frames_nonneg = frames.max(0);
+        let outs_nonneg = outs.max(0);
+
+        let setup = ProcessSetup {
+            process_mode: process_consts::PROCESS_MODE_REALTIME,
+            sample_rate,
+            max_samples_per_block: frames_nonneg,
+            symbolic_sample_size: process_consts::SYMBOLIC_SAMPLE_32,
+            flags: 0,
+        };
+        let tr = proc.setup_processing(&setup);
+        if tr != K_RESULT_OK {
+            return Err(HostError::TResult("IAudioProcessor::setupProcessing", tr));
+        }
+
+        let frame_count = frames_nonneg as usize;
+        let out_channels = outs_nonneg as usize;
+        let mut channel_storage: Vec<Vec<openvst3_abi::Sample32>> =
+            (0..out_channels).map(|_| vec![0.0; frame_count]).collect();
+        let mut channel_ptrs: Vec<*mut openvst3_abi::Sample32> = channel_storage
+            .iter_mut()
+            .map(|buf| buf.as_mut_ptr())
+            .collect();
+        let mut out_bus = AudioBusBuffers32 {
+            num_channels: outs_nonneg,
+            silence_flags: if outs_nonneg <= 0 {
+                0
+            } else if outs_nonneg as u32 >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << outs_nonneg) - 1
+            },
+            channel_buffers: channel_ptrs.as_mut_ptr(),
+        };
+        let mut process_data = ProcessData32 {
+            num_inputs: 0,
+            num_outputs: 1,
+            inputs: ptr::null_mut(),
+            outputs: &mut out_bus as *mut _,
+            num_samples: frames_nonneg,
+        };
+
+        let tr = proc.set_processing(1);
+        if tr != K_RESULT_OK {
+            return Err(HostError::TResult("IAudioProcessor::setProcessing(1)", tr));
+        }
+        processing_on = true;
+
+        let tr = proc.process_32f(&mut process_data);
+        if tr != K_RESULT_OK {
+            return Err(HostError::TResult("IAudioProcessor::process", tr));
+        }
+
+        Ok(())
+    }();
+
+    if processing_on {
+        let _ = proc.set_processing(0);
+    }
+    if need_terminate {
+        let _ = proc.terminate();
+    }
+
+    let unknown = instance as *mut FUnknown;
+    let _ = (*unknown).release();
+
+    result
 }
