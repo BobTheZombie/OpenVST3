@@ -1,60 +1,26 @@
-use anyhow::Result;
 use clap::Parser;
+use openvst3_host as host;
 use std::path::PathBuf;
 
+/// Load a VST3 inner binary (.dll/.so/.dylib) and print IPluginFactory::countClasses()
 #[derive(Parser, Debug)]
+#[command(author, version, about)]
 struct Args {
-    /// Path to the VST3 binary (.so inside the .vst3 bundle)
-    #[arg(long)]
+    /// Path to inner binary (not the .vst3 directory). Phase 4 will add bundle resolution.
+    #[arg(long, value_name = "FILE")]
     plugin: PathBuf,
-    /// Blocks to render
-    #[arg(long, default_value_t = 16)]
-    blocks: usize,
-    /// Block size (frames)
-    #[arg(long, default_value_t = 256)]
-    block_size: usize,
-    /// Sample rate
-    #[arg(long, default_value_t = 48000)]
-    sr: u32,
-    /// Input channels
-    #[arg(long, default_value_t = 2)]
-    r#in: usize,
-    /// Output channels
-    #[arg(long, default_value_t = 2)]
-    out: usize,
 }
 
-fn main() -> Result<()> {
-    let a = Args::parse();
-    unsafe {
-        let f = openvst3_host::LoadedFactory::load_plugin(&a.plugin)?;
-        let classes = f.classes()?;
-        let cid = classes
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("no classes in factory"))?
-            .cid;
-        println!("Using class: {} [{}]", classes[0].name, classes[0].category);
-        let mut proc = f.create_audio_processor(cid)?;
-        proc.initialize()?;
-        proc.setup(
-            a.sr as f64,
-            a.block_size as i32,
-            a.r#in as i32,
-            a.out as i32,
-        )?;
-        proc.set_active(true)?;
-
-        // Prepare buffers
-        let mut inputs: Vec<Vec<f32>> = (0..a.r#in).map(|_| vec![0.0; a.block_size]).collect();
-        let mut outputs: Vec<Vec<f32>> = (0..a.out).map(|_| vec![0.0; a.block_size]).collect();
-
-        for _ in 0..a.blocks {
-            let in_slices: Vec<&[f32]> = inputs.iter().map(|v| &v[..]).collect();
-            let mut out_slices: Vec<&mut [f32]> = outputs.iter_mut().map(|v| &mut v[..]).collect();
-            proc.process_f32(&in_slices, &mut out_slices, a.block_size)?;
+fn main() {
+    let args = Args::parse();
+    match host::Module::load(&args.plugin) {
+        Ok(mut module) => {
+            let n = host::count_classes(&mut module);
+            println!("countClasses = {n}");
         }
-        proc.set_active(false)?;
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
     }
-    println!("Done.");
-    Ok(())
 }
