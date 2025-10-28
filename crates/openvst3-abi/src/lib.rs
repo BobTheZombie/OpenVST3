@@ -1,19 +1,13 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![allow(non_camel_case_types)]
 //! Clean-room, header-free minimal ABI for VST3 hosting & modules.
-//! This crate intentionally mirrors public documentation naming to preserve ABI.
-//! It does **not** include or depend on Steinberg headers.
-//!
-//! Phase 1: FUnknown, IPluginFactory, GetPluginFactory.
-//! Later phases: IPluginBase/IComponent/IAudioProcessor/etc.
-
-#[cfg(feature = "std")]
-extern crate std as alloc_std;
+//! Phase 1: FUnknown, IPluginFactory, GetPluginFactory
+//! Phase 2: PClassInfo/PClassInfo2 + IPluginFactory::getClassInfo
 
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-// ----- Core scalar types (per public docs) -----------------------------------
+// ----- Core scalar types -----
 pub type int16 = i16;
 pub type int32 = i32;
 pub type int64 = i64;
@@ -21,48 +15,42 @@ pub type uint32 = u32;
 pub type uint64 = u64;
 pub type tresult = int32;
 
-// Success / failure codes (matching public semantics; numeric values chosen to
-// match common usage in examples: 0 = OK, non-zero = failure; kNoInterface is
-// commonly observed as a negative error code in host examples).
 pub const K_RESULT_OK: tresult = 0;
-pub const K_RESULT_FALSE: tresult = 1; // generic "false but not error"
+pub const K_RESULT_FALSE: tresult = 1;
 pub const K_NOT_IMPLEMENTED: tresult = -1;
 pub const K_NO_INTERFACE: tresult = -2;
 pub const K_INVALID_ARG: tresult = -3;
 pub const K_INTERNAL_ERR: tresult = -4;
 
-/// 16-byte type used for IIDs/CIDs (a.k.a. TUID in docs).
+/// 16-byte type used for IIDs/CIDs (TUID/FUID).
 #[repr(C)]
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct Tuid(pub [u8; 16]);
-
-impl Tuid {
-    pub const fn new(bytes: [u8; 16]) -> Self { Self(bytes) }
-}
-
-/// FUID is semantically identical to TUID for our purposes (IID/CID).
 pub type Fuid = Tuid;
 
-/// Helper macro to define a `Tuid` from 16 literal bytes in COM layout.
+impl Tuid {
+    pub const fn new(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+}
+
 #[macro_export]
 macro_rules! tuid {
     ($b0:expr,$b1:expr,$b2:expr,$b3:expr,$b4:expr,$b5:expr,$b6:expr,$b7:expr,$b8:expr,$b9:expr,$bA:expr,$bB:expr,$bC:expr,$bD:expr,$bE:expr,$bF:expr) => {
-        $crate::Tuid::new([$b0,$b1,$b2,$b3,$b4,$b5,$b6,$b7,$b8,$b9,$bA,$bB,$bC,$bD,$bE,$bF])
+        $crate::Tuid::new([
+            $b0, $b1, $b2, $b3, $b4, $b5, $b6, $b7, $b8, $b9, $bA, $bB, $bC, $bD, $bE, $bF,
+        ])
     };
 }
 
-// ----- FUnknown (base interface; COM-like) -----------------------------------
-//
-// Methods are function pointers in a vtable with C calling convention.
-//   query_interface(self, iid, obj_out) -> tresult
-//   add_ref(self) -> u32
-//   release(self) -> u32
-//
-// NOTE: We purposely avoid any C++ ABI assumptions: this is a C layout vtable.
-
+// ===== FUnknown =====
 #[repr(C)]
 pub struct FUnknownVTable {
-    pub query_interface: unsafe extern "C" fn(this_: *mut FUnknown, iid: *const Fuid, obj: *mut *mut c_void) -> tresult,
+    pub query_interface: unsafe extern "C" fn(
+        this_: *mut FUnknown,
+        iid: *const Fuid,
+        obj: *mut *mut c_void,
+    ) -> tresult,
     pub add_ref: unsafe extern "C" fn(this_: *mut FUnknown) -> u32,
     pub release: unsafe extern "C" fn(this_: *mut FUnknown) -> u32,
 }
@@ -75,7 +63,11 @@ pub struct FUnknown {
 impl FUnknown {
     #[inline]
     pub unsafe fn query_interface<T>(&mut self, iid: &Fuid, out: *mut *mut T) -> tresult {
-        ((*self.vtbl).query_interface)(self, iid as *const _ as *const Fuid, out as *mut *mut c_void)
+        ((*self.vtbl).query_interface)(
+            self,
+            iid as *const _ as *const Fuid,
+            out as *mut *mut c_void,
+        )
     }
     #[inline]
     pub unsafe fn add_ref(&mut self) -> u32 {
@@ -87,30 +79,66 @@ impl FUnknown {
     }
 }
 
-// ----- IPluginFactory (Phase 1) ----------------------------------------------
+// ===== Class info structs =====
 //
-// Public docs describe the factory as the anchor provided by GetPluginFactory().
-// Methods we rely on here:
-//   countClasses() -> int32
-//   createInstance(class_id: *const TUID, iid: *const TUID, obj: **void) -> tresult
-//
-// We deliberately postpone getClassInfo*/PClassInfo layouts to Phase 2.
+// The public docs show PClassInfo2 fields and sizes (vendor/version/subcats) and
+// refer to PClassInfo::kNameSize and kCategorySize. In practice, hosts should
+// accept at least 64 for name and 32 for category (commonly used values).
+// We define numeric constants accordingly for our ABI boundary.
+pub mod classinfo_consts {
+    pub const K_NAME_SIZE: usize = 64; // PClassInfo::kNameSize (commonly 64)
+    pub const K_CATEGORY_SIZE: usize = 32; // PClassInfo::kCategorySize (commonly 32)
+    pub const K_VENDOR_SIZE: usize = 64; // PClassInfo2::kVendorSize
+    pub const K_VERSION_SIZE: usize = 64; // PClassInfo2::kVersionSize
+    pub const K_SUBCATS_SIZE: usize = 128; // PClassInfo2::kSubCategoriesSize
+}
 
+/// PClassInfo (version 1) per public docs: CID, cardinality, category, name.
+#[repr(C)]
+pub struct PClassInfo {
+    pub cid: [i8; 16], // raw 16-byte CID
+    pub cardinality: int32,
+    pub category: [i8; classinfo_consts::K_CATEGORY_SIZE],
+    pub name: [i8; classinfo_consts::K_NAME_SIZE],
+}
+
+/// PClassInfo2 extends PClassInfo with flags/vendor/version/sdkVersion/subCategories.
+#[repr(C)]
+pub struct PClassInfo2 {
+    pub cid: [i8; 16],
+    pub cardinality: int32,
+    pub category: [i8; classinfo_consts::K_CATEGORY_SIZE],
+    pub name: [i8; classinfo_consts::K_NAME_SIZE],
+    pub class_flags: u32,
+    pub sub_categories: [i8; classinfo_consts::K_SUBCATS_SIZE],
+    pub vendor: [i8; classinfo_consts::K_VENDOR_SIZE],
+    pub version: [i8; classinfo_consts::K_VERSION_SIZE],
+    pub sdk_version: [i8; classinfo_consts::K_VERSION_SIZE],
+}
+
+// ===== IPluginFactory =====
 #[repr(C)]
 pub struct IPluginFactoryVTable {
-    // FUnknown base (must be first / same layout)
-    pub query_interface: unsafe extern "C" fn(this_: *mut FUnknown, iid: *const Fuid, obj: *mut *mut c_void) -> tresult,
+    // FUnknown base
+    pub query_interface: unsafe extern "C" fn(
+        this_: *mut FUnknown,
+        iid: *const Fuid,
+        obj: *mut *mut c_void,
+    ) -> tresult,
     pub add_ref: unsafe extern "C" fn(this_: *mut FUnknown) -> u32,
     pub release: unsafe extern "C" fn(this_: *mut FUnknown) -> u32,
 
-    // IPluginFactory
+    // IPluginFactory v1
+    pub get_factory_info:
+        unsafe extern "C" fn(this_: *mut IPluginFactory, info: *mut c_void) -> tresult, // we’ll bind PFactoryInfo later
     pub count_classes: unsafe extern "C" fn(this_: *mut IPluginFactory) -> int32,
+    pub get_class_info: unsafe extern "C" fn(
+        this_: *mut IPluginFactory,
+        index: int32,
+        info: *mut PClassInfo,
+    ) -> tresult,
 
-    // We will bind getClassInfo* in Phase 2
-    pub _get_class_info: *const c_void,
-    pub _get_class_info2: *const c_void,
-    pub _get_class_info3: *const c_void,
-
+    // createInstance
     pub create_instance: unsafe extern "C" fn(
         this_: *mut IPluginFactory,
         cid: *const Tuid,
@@ -134,6 +162,10 @@ impl IPluginFactory {
         ((*self.vtbl).count_classes)(self)
     }
     #[inline]
+    pub unsafe fn get_class_info(&mut self, index: int32, out: *mut PClassInfo) -> tresult {
+        ((*self.vtbl).get_class_info)(self, index, out)
+    }
+    #[inline]
     pub unsafe fn create_instance_raw(
         &mut self,
         cid: &Tuid,
@@ -144,17 +176,12 @@ impl IPluginFactory {
     }
 }
 
-/// Type of the module entry point symbol: `GetPluginFactory`
-///
-/// Public docs: a C-style export named `GetPluginFactory` returning the factory.
-/// We intentionally use `extern "C"` here (not "system") to match cross-platform
-/// expectations in public examples.
+/// Signature of the module entry point: `GetPluginFactory`
 pub type GetPluginFactoryProc = unsafe extern "C" fn() -> *mut IPluginFactory;
 
-// Safe wrapper for non-null factory pointer
+// Non-null wrapper
 #[derive(Copy, Clone)]
 pub struct FactoryHandle(NonNull<IPluginFactory>);
-
 impl FactoryHandle {
     pub unsafe fn new(ptr: *mut IPluginFactory) -> Option<Self> {
         NonNull::new(ptr).map(Self)
@@ -164,11 +191,10 @@ impl FactoryHandle {
     }
 }
 
-// Marker types for IIDs/CIDs we’ll introduce in later phases.
+// Marker wrappers (future use)
 pub struct InterfaceId(pub Fuid);
 pub struct ClassId(pub Fuid);
 
-// Prevent Send/Sync by default, these are raw interface pointers.
+// Allow moving across threads (host responsibility to call on correct threads)
 unsafe impl Send for FactoryHandle {}
 unsafe impl Sync for FactoryHandle {}
-
