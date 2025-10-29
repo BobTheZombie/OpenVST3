@@ -1,0 +1,11 @@
+[package]
+name = "realtime-host-cli"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+cpal = "0.15"
+openvst3-host = { path = "../../crates/openvst3-host" }
+openvst3-abi = { path = "../../crates/openvst3-abi" }

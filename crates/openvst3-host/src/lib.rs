@@ -62,20 +62,6 @@ pub fn count_classes(module: &mut Module) -> i32 {
 
 /// BundlePath: resolve `.vst3` directory to inner binary per platform
 pub struct BundlePath;
-
-fn first_file(dir: &Path) -> Option<PathBuf> {
-    std::fs::read_dir(dir).ok()?.find_map(|e| {
-        e.ok().and_then(|entry| {
-            let path = entry.path();
-            if path.is_file() {
-                Some(path)
-            } else {
-                None
-            }
-        })
-    })
-}
-
 impl BundlePath {
     pub fn resolve<P: AsRef<Path>>(bundle: P) -> Result<PathBuf, HostError> {
         let b = bundle.as_ref();
@@ -85,8 +71,14 @@ impl BundlePath {
         #[cfg(target_os = "macos")]
         {
             let p = b.join("Contents").join("MacOS");
-            let bin = first_file(&p).ok_or(HostError::BinaryNotFound)?;
-            return Ok(bin);
+            let bin = std::fs::read_dir(&p)
+                .ok()
+                .and_then(|mut it| {
+                    it.find(|e| e.as_ref().ok().map_or(false, |ee| ee.path().is_file()))
+                        .ok()
+                })
+                .ok_or(HostError::BinaryNotFound)?;
+            return Ok(bin.path());
         }
         #[cfg(target_os = "linux")]
         {
@@ -98,8 +90,14 @@ impl BundlePath {
                 "unknown-linux"
             };
             let p = b.join("Contents").join(arch);
-            let bin = first_file(&p).ok_or(HostError::BinaryNotFound)?;
-            return Ok(bin);
+            let bin = std::fs::read_dir(&p)
+                .ok()
+                .and_then(|mut it| {
+                    it.find(|e| e.as_ref().ok().map_or(false, |ee| ee.path().is_file()))
+                        .ok()
+                })
+                .ok_or(HostError::BinaryNotFound)?;
+            return Ok(bin.path());
         }
         #[cfg(target_os = "windows")]
         {
@@ -109,8 +107,14 @@ impl BundlePath {
                 "x86-win"
             };
             let p = b.join("Contents").join(arch);
-            let bin = first_file(&p).ok_or(HostError::BinaryNotFound)?;
-            return Ok(bin);
+            let bin = std::fs::read_dir(&p)
+                .ok()
+                .and_then(|mut it| {
+                    it.find(|e| e.as_ref().ok().map_or(false, |ee| ee.path().is_file()))
+                        .ok()
+                })
+                .ok_or(HostError::BinaryNotFound)?;
+            return Ok(bin.path());
         }
     }
 }
@@ -175,7 +179,7 @@ pub fn list_classes(
     Ok(out)
 }
 
-// ===== Phase 4 helpers: IID parsing, QI, process 32f/64f =====================
+// ===== Phase 4/5 helpers: IID parsing, create/QI, process 32f/64f ============
 pub fn parse_hex_16(s: &str) -> Result<[u8; 16], HostError> {
     let t = s
         .trim()
@@ -193,7 +197,6 @@ pub fn parse_hex_16(s: &str) -> Result<[u8; 16], HostError> {
     Ok(out)
 }
 
-/// Create an instance using cid & iid (both raw 16-byte); returns raw void*.
 pub unsafe fn create_instance_raw(
     factory: &mut IPluginFactory,
     cid: [u8; 16],
@@ -207,7 +210,6 @@ pub unsafe fn create_instance_raw(
     Ok(obj)
 }
 
-/// Try QueryInterface on an object (FUnknown*) for a new IID; returns raw void*.
 pub unsafe fn query_interface(
     obj: *mut core::ffi::c_void,
     iid: [u8; 16],
@@ -221,7 +223,6 @@ pub unsafe fn query_interface(
     Ok(out)
 }
 
-/// Read the first output bus channel count if available (graceful on failure)
 pub unsafe fn detect_output_channels(comp_ptr: *mut IComponent) -> i32 {
     let comp = &mut *comp_ptr;
     let count = comp.get_bus_count(0, BUS_DIR_OUTPUT);
@@ -244,7 +245,26 @@ pub unsafe fn detect_output_channels(comp_ptr: *mut IComponent) -> i32 {
     }
 }
 
-/// Drive one 32f process block on an IAudioProcessor*
+/// Call setBusArrangements with caller-provided arrangement IDs.
+pub unsafe fn set_bus_arrangements(
+    proc_ptr: *mut IAudioProcessor,
+    in_arrs: &[u64],
+    out_arrs: &[u64],
+) -> Result<(), HostError> {
+    let proc = &mut *proc_ptr;
+    let tr = proc.set_bus_arrangements(
+        in_arrs.as_ptr(),
+        in_arrs.len() as i32,
+        out_arrs.as_ptr(),
+        out_arrs.len() as i32,
+    );
+    if tr != K_RESULT_OK {
+        return Err(HostError::TErr(tr));
+    }
+    Ok(())
+}
+
+/// Drive one 32f process block on an IAudioProcessor* (param/events null)
 pub unsafe fn drive_null_process_32f(
     proc_ptr: *mut IAudioProcessor,
     sr: f64,
@@ -253,13 +273,11 @@ pub unsafe fn drive_null_process_32f(
 ) -> Result<(), HostError> {
     let proc = &mut *proc_ptr;
 
-    // initialize(null)
     let tr = proc.initialize(core::ptr::null_mut::<FUnknown>());
     if tr != K_RESULT_OK {
         return Err(HostError::TErr(tr));
     }
 
-    // setupProcessing
     let setup = ProcessSetup {
         process_mode: process_consts::PROCESS_MODE_REALTIME,
         sample_rate: sr,
@@ -272,7 +290,6 @@ pub unsafe fn drive_null_process_32f(
         return Err(HostError::TErr(tr));
     }
 
-    // allocate output buffers (silence)
     let mut chans: Vec<Vec<f32>> = (0..outs).map(|_| vec![0.0f32; nframes as usize]).collect();
     let mut chan_ptrs: Vec<*mut f32> = chans.iter_mut().map(|c| c.as_mut_ptr()).collect();
     let mut outs_bus = AudioBusBuffers32 {
@@ -287,6 +304,10 @@ pub unsafe fn drive_null_process_32f(
         inputs: core::ptr::null_mut(),
         outputs: &mut outs_bus,
         num_samples: nframes,
+        input_parameter_changes: core::ptr::null_mut(),
+        output_parameter_changes: core::ptr::null_mut(),
+        input_events: core::ptr::null_mut(),
+        output_events: core::ptr::null_mut(),
     };
 
     let tr = proc.set_processing(1);
@@ -304,7 +325,7 @@ pub unsafe fn drive_null_process_32f(
     Ok(())
 }
 
-/// Drive one 64f process block on an IAudioProcessor*
+/// Drive one 64f process block on an IAudioProcessor* (param/events null)
 pub unsafe fn drive_null_process_64f(
     proc_ptr: *mut IAudioProcessor,
     sr: f64,
@@ -344,6 +365,10 @@ pub unsafe fn drive_null_process_64f(
         inputs: core::ptr::null_mut(),
         outputs: &mut outs_bus,
         num_samples: nframes,
+        input_parameter_changes: core::ptr::null_mut(),
+        output_parameter_changes: core::ptr::null_mut(),
+        input_events: core::ptr::null_mut(),
+        output_events: core::ptr::null_mut(),
     };
 
     let tr = proc.set_processing(1);
