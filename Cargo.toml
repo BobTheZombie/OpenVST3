@@ -3,6 +3,7 @@ members = [
     "crates/openvst3-abi",
     "crates/openvst3-host",
     "examples/host-cli",
+    "examples/realtime-host-cli",
 ]
 resolver = "2"
 
